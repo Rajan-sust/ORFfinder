@@ -91,7 +91,8 @@ func isStop(c []byte) bool {
 // for all ATG-initiated ORFs per standard ORFfinder behaviour, we
 // keep ATG-only here. Pass -altstart flag (future) to enable the rest.
 func isStart(c []byte) bool {
-	return c[0] == 'A' && c[1] == 'T' && c[2] == 'G'
+	s := string(c)
+	return s == "ATG"
 }
 
 // translate converts a nucleotide slice to an amino-acid string.
@@ -385,22 +386,44 @@ func writeFasta(w *bufio.Writer, orfs []ORF) {
 
 // removeOverlaps filters ORFs using strand-aware greedy interval scheduling.
 //
-// Biological rules implemented:
-//   1. SAME-STRAND overlaps → keep only the longest; drop shorter conflicts.
-//      Two ORFs on the same strand cannot both be expressed from the same
-//      physical DNA region without frameshift — the longer one wins.
-//   2. OPPOSITE-STRAND (antisense) overlaps → always ALLOW both.
-//      Antisense overlapping genes are a well-documented prokaryotic feature:
-//      two genes transcribed from opposite strands sharing a genomic region
-//      are independently regulated and translated.
+// Three-tier biological rules:
 //
-// Algorithm:
-//   1. Sort all ORFs by length descending (longest = highest priority).
-//   2. Walk the sorted list; for each ORF check only accepted ORFs on the
-//      SAME strand of the SAME sequence for interval conflict.
-//      Conflict: [a,b] vs [c,d] overlap iff a <= d && c <= b.
-//   3. Re-sort accepted ORFs by SeqID + Start for output.
-func removeOverlaps(orfs []ORF) []ORF {
+//  TIER 1 — OPPOSITE-STRAND overlaps → ALWAYS allowed.
+//    Antisense overlapping genes are a well-documented prokaryotic feature.
+//    Two genes on opposite strands are transcribed and translated independently
+//    even when they share a genomic coordinate range.
+//
+//  TIER 2 — SAME-STRAND CROSSING overlaps within -maxoverlap → ALLOWED.
+//    "Crossing" means the intervals interleave at their boundary:
+//         gene A:  ──────────[endA]
+//         gene B:        [startB]──────────
+//    This is translational coupling: the start of gene B overlaps the end
+//    of gene A by a few nucleotides (classically 1–4 nt, e.g. the "ATGA"
+//    motif where TGA stop of gene A and ATG start of gene B share one base).
+//    The -maxoverlap flag (default 4) sets the maximum crossing nt allowed.
+//    Pseudomonas aeruginosa example:
+//         gene 1  3169..4278
+//         gene 2  4275..6695  ← 4-nt crossing overlap → translational coupling ✓
+//
+//  TIER 3 — all other same-strand overlaps → CONFLICT, keep longest.
+//    This includes:
+//      • Nested ORFs (one fully or largely inside the other) — not coupling.
+//      • Crossing overlaps larger than -maxoverlap — not coupling.
+//    The longer ORF wins; the shorter is discarded.
+//
+// Crossing vs nesting — the key distinction:
+//    Crossing:  a.Start < b.Start < a.End < b.End  (or mirror)  → may be coupling
+//    Nesting:   a.Start < b.Start AND b.End < a.End (or mirror)  → always conflict
+//
+// Algorithm — greedy interval scheduling by length (longest-first):
+//   1. Sort ORFs by length descending; tie-break by Start ascending.
+//   2. For each candidate ORF, check every same-strand accepted interval:
+//        a. Compute overlap length = max(0, min(endA,endB) - max(startA,startB) + 1)
+//        b. If overlap == 0 → no conflict.
+//        c. If intervals CROSS and overlap <= maxSameStrandOverlap → coupling, no conflict.
+//        d. Otherwise → conflict, discard candidate.
+//   3. Re-sort accepted set by SeqID + Start for output.
+func removeOverlaps(orfs []ORF, maxSameStrandOverlap int) []ORF {
 	// Sort by length descending; tie-break by Start ascending (deterministic).
 	sort.Slice(orfs, func(i, j int) bool {
 		if orfs[i].Length != orfs[j].Length {
@@ -409,22 +432,31 @@ func removeOverlaps(orfs []ORF) []ORF {
 		return orfs[i].Start < orfs[j].Start
 	})
 
-	// strandKey combines SeqID + strand so opposite-strand ORFs never compete.
 	type interval struct{ start, end int }
-	accepted := make(map[string][]interval, 32) // key = seqid+strand
+	accepted := make(map[string][]interval, 32) // key = seqid + "\x00" + strand
 	kept := make([]ORF, 0, len(orfs))
 
 	for _, o := range orfs {
-		// Only check same-strand accepted intervals for this sequence.
+		// Tier 1: opposite-strand ORFs go into a separate bucket → never compete.
 		key := o.SeqID + "\x00" + o.Strand
-		overlaps := false
+		conflict := false
 		for _, iv := range accepted[key] {
-			if o.Start <= iv.end && iv.start <= o.End {
-				overlaps = true
-				break
+			overlap := min(o.End, iv.end) - max(o.Start, iv.start) + 1
+			if overlap <= 0 {
+				continue // no overlap at all — fine
 			}
+			// Tier 2: crossing overlap within coupling tolerance → fine.
+			// Crossing means the intervals interleave at their ends, NOT nest.
+			crossing := (o.Start < iv.start && iv.start <= o.End && o.End < iv.end) ||
+				(iv.start < o.Start && o.Start <= iv.end && iv.end < o.End)
+			if crossing && overlap <= maxSameStrandOverlap {
+				continue // translational coupling — allow both
+			}
+			// Tier 3: any other same-strand overlap is a genuine conflict.
+			conflict = true
+			break
 		}
-		if !overlaps {
+		if !conflict {
 			accepted[key] = append(accepted[key], interval{o.Start, o.End})
 			kept = append(kept, o)
 		}
@@ -440,6 +472,20 @@ func removeOverlaps(orfs []ORF) []ORF {
 	return kept
 }
 
+// min/max helpers (Go 1.21+ has these built-in; keep for compatibility).
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 // ─────────────────────────────────────────────
 //  Pipeline Orchestrator
 // ─────────────────────────────────────────────
@@ -451,6 +497,7 @@ func run(
 	outFormat string,
 	doTranslate bool,
 	numWorkers int,
+	maxOverlap int,
 	verbose bool,
 ) error {
 	start := time.Now()
@@ -520,7 +567,7 @@ func run(
 
 	// ── Remove overlapping ORFs (keep longest per locus) ──
 	beforeFilter := len(allORFs)
-	allORFs = removeOverlaps(allORFs)
+	allORFs = removeOverlaps(allORFs, maxOverlap)
 
 	elapsed := time.Since(start)
 
@@ -574,8 +621,9 @@ func main() {
 		minLen      = flag.Int("min", 300, "Minimum ORF length in nucleotides (default: 300)")
 		outFormat   = flag.String("fmt", "tsv", "Output format: tsv | gff3 | fasta  (default: tsv)")
 		doTranslate = flag.Bool("translate", false, "Translate ORFs to protein sequences (slower)")
-		numWorkers  = flag.Int("workers", runtime.NumCPU(), "Number of parallel worker goroutines")
-		verbose     = flag.Bool("v", true, "Verbose / progress output to stderr")
+		numWorkers      = flag.Int("workers", runtime.NumCPU(), "Number of parallel worker goroutines")
+		maxOverlap      = flag.Int("maxoverlap", 4, "Max same-strand overlap (nt) allowed between adjacent genes (default: 4, covers translational coupling)")
+		verbose         = flag.Bool("v", false, "Verbose / progress output to stderr")
 	)
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, `
@@ -613,11 +661,11 @@ Examples:
 	}
 
 	if *verbose {
-		fmt.Fprintf(os.Stderr, "[info] ORFfinder starting — workers=%d minLen=%d format=%s\n",
-			*numWorkers, *minLen, *outFormat)
+		fmt.Fprintf(os.Stderr, "[info] ORFfinder starting — workers=%d minLen=%d format=%s maxoverlap=%d\n",
+			*numWorkers, *minLen, *outFormat, *maxOverlap)
 	}
 
-	if err := run(*inputPath, *outputPath, *minLen, *outFormat, *doTranslate, *numWorkers, *verbose); err != nil {
+	if err := run(*inputPath, *outputPath, *minLen, *outFormat, *doTranslate, *numWorkers, *maxOverlap, *verbose); err != nil {
 		fmt.Fprintf(os.Stderr, "[error] %v\n", err)
 		os.Exit(1)
 	}
