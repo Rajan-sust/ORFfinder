@@ -383,16 +383,23 @@ func writeFasta(w *bufio.Writer, orfs []ORF) {
 //  Overlap Filter
 // ─────────────────────────────────────────────
 
-// removeOverlaps filters ORFs so that no two reported ORFs share even a single
-// nucleotide on the genome, regardless of strand or frame.
+// removeOverlaps filters ORFs using strand-aware greedy interval scheduling.
 //
-// Algorithm — greedy interval scheduling by length (longest-first):
+// Biological rules implemented:
+//   1. SAME-STRAND overlaps → keep only the longest; drop shorter conflicts.
+//      Two ORFs on the same strand cannot both be expressed from the same
+//      physical DNA region without frameshift — the longer one wins.
+//   2. OPPOSITE-STRAND (antisense) overlaps → always ALLOW both.
+//      Antisense overlapping genes are a well-documented prokaryotic feature:
+//      two genes transcribed from opposite strands sharing a genomic region
+//      are independently regulated and translated.
+//
+// Algorithm:
 //   1. Sort all ORFs by length descending (longest = highest priority).
-//   2. Walk the list; accept an ORF only if its [Start,End] interval does not
-//      overlap any already-accepted ORF on the same SeqID.
+//   2. Walk the sorted list; for each ORF check only accepted ORFs on the
+//      SAME strand of the SAME sequence for interval conflict.
+//      Conflict: [a,b] vs [c,d] overlap iff a <= d && c <= b.
 //   3. Re-sort accepted ORFs by SeqID + Start for output.
-//
-// Two intervals [a,b] and [c,d] overlap iff a <= d && c <= b.
 func removeOverlaps(orfs []ORF) []ORF {
 	// Sort by length descending; tie-break by Start ascending (deterministic).
 	sort.Slice(orfs, func(i, j int) bool {
@@ -402,21 +409,23 @@ func removeOverlaps(orfs []ORF) []ORF {
 		return orfs[i].Start < orfs[j].Start
 	})
 
-	// accepted holds the non-overlapping set, keyed by SeqID for fast lookup.
+	// strandKey combines SeqID + strand so opposite-strand ORFs never compete.
 	type interval struct{ start, end int }
-	accepted := make(map[string][]interval, 16)
+	accepted := make(map[string][]interval, 32) // key = seqid+strand
 	kept := make([]ORF, 0, len(orfs))
 
 	for _, o := range orfs {
+		// Only check same-strand accepted intervals for this sequence.
+		key := o.SeqID + "\x00" + o.Strand
 		overlaps := false
-		for _, iv := range accepted[o.SeqID] {
+		for _, iv := range accepted[key] {
 			if o.Start <= iv.end && iv.start <= o.End {
 				overlaps = true
 				break
 			}
 		}
 		if !overlaps {
-			accepted[o.SeqID] = append(accepted[o.SeqID], interval{o.Start, o.End})
+			accepted[key] = append(accepted[key], interval{o.Start, o.End})
 			kept = append(kept, o)
 		}
 	}
@@ -566,7 +575,7 @@ func main() {
 		outFormat   = flag.String("fmt", "tsv", "Output format: tsv | gff3 | fasta  (default: tsv)")
 		doTranslate = flag.Bool("translate", false, "Translate ORFs to protein sequences (slower)")
 		numWorkers  = flag.Int("workers", runtime.NumCPU(), "Number of parallel worker goroutines")
-		verbose     = flag.Bool("v", false, "Verbose / progress output to stderr")
+		verbose     = flag.Bool("v", true, "Verbose / progress output to stderr")
 	)
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, `
